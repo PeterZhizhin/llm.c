@@ -1,0 +1,11 @@
+CompileFlags:
+  Add:
+  - --cuda-gpu-arch=sm_75
+  - -g 
+  - -L/usr/local/cuda/targets/x86_64-linux/lib/
+  - -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
+  - -lcudart 
+  - -lmpi
+  - -lmpi_cxx 
+  - -lnccl 
+  - -I/usr/lib/x86_64-linux-gnu/openmpi/include/
