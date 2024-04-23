@@ -11,6 +11,8 @@ NVCC := $(shell which nvcc 2>/dev/null)
 # NVCC flags
 NVCC_FLAGS = -O3 --use_fast_math
 NVCC_LDFLAGS = -lcublas -lcublasLt
+NCLL_INCLUDES = 
+NVCC_LDLIBS =
 
 # Function to test if the compiler accepts a given flag.
 define check_and_add_flag
@@ -65,6 +67,20 @@ else
   endif
 endif
 
+ifeq ($(NO_MPI), 1)
+  $(info OpenMPI is manually disabled)
+else
+  # Detect if running on macOS or Linux
+  ifeq ($(shell uname), Darwin)
+    $(warning MPI on Darwin is not supported, skipping MPI support)
+  else
+    $(info Adding OpenMPI support)
+    NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
+    NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
+    NVCC_LDLIBS += -lmpi -lnccl
+  endif
+endif
+
 # PHONY means these targets will always be executed
 .PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu
 
@@ -91,7 +107,7 @@ train_gpt2cu: train_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
 
 train_gpt2fp32cu: train_gpt2_fp32.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $< $(NVCC_LDFLAGS) -o $@
 
 test_gpt2cu: test_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@

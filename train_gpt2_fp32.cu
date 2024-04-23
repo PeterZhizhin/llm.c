@@ -11,21 +11,22 @@ sure that those parts work out ok and that we do a += as necessary. E.g.,
 the layernorms are connected to the residuals so we += in layernorm backward.
 */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <ctype.h>
-#include <math.h>
-#include <time.h>
 #include <assert.h>
-#include <float.h>
-#include <string.h>
-#include <unistd.h>
-#include <assert.h>
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cublasLt.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <ctype.h>
+#include <cublasLt.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+#include <float.h>
+#include <math.h>
+#include <mpi.h>
+#include <nccl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -52,6 +53,28 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
     }
 }
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
+
+void nccl_check(ncclResult_t status, const char *file, int line) {
+  if (status != ncclSuccess) {
+    printf("[NCCL ERROR] at file %s:%d:\n%s\n", file, line,
+           ncclGetErrorString(status));
+    exit(EXIT_FAILURE);
+  }
+}
+#define ncclCheck(err) (nccl_check(err, __FILE__, __LINE__))
+
+void mpi_check(int status, const char *file, int line) {
+  if (status != MPI_SUCCESS) {
+    char mpi_error[4096];
+    int mpi_error_len = 0;
+    assert(MPI_Error_string(status, &mpi_error[0], &mpi_error_len) ==
+           MPI_SUCCESS);
+    printf("[MPI ERROR] at file %s:%d:\n%.*s\n", file, line, mpi_error_len,
+           mpi_error);
+    exit(EXIT_FAILURE);
+  }
+}
+#define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
 
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
 static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
@@ -1275,6 +1298,54 @@ float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) 
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
 
+// Parameters specific to training on multiple GPUs.
+typedef struct {
+  int process_rank;      // Rank of this process among all MPI processes.
+  int mpi_world_size;    // Total number of MPI processes.
+  int local_device_idx;  // This process GPU index on current machine.
+  ncclComm_t comm;       // NCCL communication primitive, used for collective mutli-GPU work.
+  cudaStream_t stream;   // CUDA stream used for NCCL communications.
+} NcclConfig;
+
+NcclConfig nccl_config_init(int *argc, char ***argv) {
+  NcclConfig result;
+
+  // Initialize MPI.
+  mpiCheck(MPI_Init(argc, argv));
+  mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
+  mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &result.mpi_world_size));
+
+  // TODO(Peter Zhizhin): Fetch local process rank. Use gethostname to get
+  // hostname of all processes. Compute local rank using hostnames.
+  result.local_device_idx = result.process_rank;
+
+  cudaCheck(cudaSetDevice(result.local_device_idx));
+
+  ncclUniqueId nccl_id;
+  if (result.process_rank == 0) {
+    ncclCheck(ncclGetUniqueId(&nccl_id));
+  }
+  mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0,
+                     MPI_COMM_WORLD));
+
+
+  ncclCheck(ncclCommInitRank(&result.comm, result.mpi_world_size, nccl_id, result.process_rank));
+
+  // Create a stream for cross-device operations.
+  // cudaCheck(cudaStreamCreate(&result.stream));
+  result.stream = 0;
+
+  return result;
+}
+
+void nccl_config_free(const NcclConfig* nccl_config) {
+    if (nccl_config->stream != 0) {
+        cudaCheck(cudaStreamDestroy(nccl_config->stream));
+    }
+    ncclCommDestroy(nccl_config->comm);
+    mpiCheck(MPI_Finalize());
+}
+
 typedef struct {
     GPT2Config config;
     // the weights of the model, and their sizes
@@ -1304,6 +1375,7 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -1482,7 +1554,16 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
         // move the (B,T) losses to CPU
         cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float), cudaMemcpyDeviceToHost));
         float mean_loss = 0.0f;
-        for (int i=0; i<B*T; i++) { mean_loss += model->cpu_losses[i]; }
+        double seq_total_loss = 0.0;
+        for (int i=0; i<B*T; i++) { 
+            seq_total_loss += model->cpu_losses[i];
+            if ((i % T == 0) && (i != 0)) {
+                printf("Sequence %d loss %.6f\n", i / T - 1, seq_total_loss / T);
+                seq_total_loss = 0;
+            }
+            mean_loss += model->cpu_losses[i]; 
+        }
+        printf("Sequence %d loss %.6f\n", B - 1, seq_total_loss / T);
         mean_loss /= B*T;
         model->mean_loss = mean_loss;
 
@@ -1621,6 +1702,53 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
 }
 
+void gpt2_nccl_accumulate(GPT2* model, NcclConfig* nccl_config, int B, int T) {
+    // Average the loss across all machines.
+    float* cpu_losses_recv = NULL;
+    if (nccl_config->process_rank == 0) {
+        cpu_losses_recv = (float*)malloc(nccl_config->mpi_world_size * B * T * sizeof(float));
+    }
+
+    MPI_Gather(
+        model->cpu_losses,
+        B * T,
+        MPI_FLOAT,
+        cpu_losses_recv,
+        B * T,
+        MPI_FLOAT,
+        0,
+        MPI_COMM_WORLD
+    );
+
+    if (nccl_config->process_rank == 0) {
+        for (int process_id = 0; process_id != nccl_config->mpi_world_size; ++process_id) {
+            // printf("Process %d\n", process_id);
+            for (int batch_i = 0; batch_i != B; ++batch_i) {
+                // printf("Batch %d\n", batch_i);
+                double seq_loss_sum = 0;
+                for (int time_i = 0; time_i != T; ++time_i) {
+                    int i = process_id * B * T + batch_i * T + time_i;
+                    double element_loss = cpu_losses_recv[i];
+                    // printf("%.6f ", element_loss);
+                    seq_loss_sum += element_loss;
+                }
+                // printf("\nSeq loss avg: %.6f\n", seq_loss_sum / T);
+            }
+            // printf("\n----------\n");
+        }
+        free(cpu_losses_recv);
+    }
+
+    mpiCheck(MPI_Allreduce(&model->mean_loss, &model->accumulated_mean_loss, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
+    model->accumulated_mean_loss /= nccl_config->mpi_world_size;
+
+    // Average all gradients
+    ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
+        model->num_parameters, 
+        ncclFloat, ncclAvg, 
+        nccl_config->comm, /*stream=*/0)); // use 0 for default stream
+}
+
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
@@ -1663,6 +1791,9 @@ void gpt2_free(GPT2 *model) {
 // data loader lite: returns random batches of data from a file of integers
 
 typedef struct {
+    // Distributed data parallel specifics
+    int process_rank;
+    int world_size;
     // hyperparameters
     int B;
     int T;
@@ -1678,7 +1809,14 @@ typedef struct {
     long num_batches;
 } DataLoader;
 
-void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
+void dataloader_init(DataLoader *loader, const NcclConfig* nccl_config, const char* filename, int B, int T) {
+    if (nccl_config == NULL) {
+        loader->process_rank = 0;
+        loader->world_size = 1;
+    } else {
+        loader->process_rank = nccl_config->process_rank;
+        loader->world_size = nccl_config->mpi_world_size;
+    }
     loader->B = B;
     loader->T = T;
 
@@ -1693,7 +1831,7 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
         printf("Error: file size is too small for the batch size and sequence length\n");
         exit(EXIT_FAILURE);
     }
-    loader->current_position = 0; // start at the beginning
+    loader->current_position = loader->process_rank * B * T * sizeof(int); // start at the beginning
 
     // allocate space for B*T + 1 integers to store the inputs and targets
     // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
@@ -1701,25 +1839,25 @@ void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
     cudaMallocHost((void**)&loader->batch, (B * T + 1) * sizeof(int));
     loader->inputs = loader->batch;
     loader->targets = loader->batch + 1; // targets are shifted by one
-    loader->num_batches = loader->file_size / (B * T * sizeof(int));
+    loader->num_batches = loader->file_size / (loader->world_size * B * T * sizeof(int));
 }
 
 void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
+    loader->current_position = loader->process_rank * loader->B * loader->T * sizeof(int);
 }
 
 void dataloader_next_batch(DataLoader *loader) {
     int B = loader->B;
     int T = loader->T;
     // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (B*T+1) * sizeof(int) > loader->file_size) {
-        loader->current_position = 0;
+    if (loader->current_position + (loader->world_size * B * T + 1) * sizeof(int) > loader->file_size) {
+        loader->current_position = loader->process_rank * B * T * sizeof(int);
     }
     // read the B*T+1 integers from the file into batch
     fseek(loader->tokens_file, loader->current_position, SEEK_SET);
     freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
     // advance the current position by B*T integers
-    loader->current_position += B*T * sizeof(int);
+    loader->current_position += loader->world_size * B * T * sizeof(int);
 }
 
 void dataloader_free(DataLoader *loader) {
@@ -1897,6 +2035,7 @@ void error_usage() {
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
+    NcclConfig nccl_config = nccl_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
     const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
@@ -1938,20 +2077,20 @@ int main(int argc, char *argv[]) {
     printf("| genT                  | %-50d |\n", genT);
     printf("+-----------------------+----------------------------------------------------+\n");
 
-    // set up the device
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, deviceIdx);
+    cudaGetDeviceProperties(&deviceProp, nccl_config.local_device_idx);
     // setup cuBLAS and cuBLASLt
     cublasCheck(cublasCreate(&cublas_handle));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+    cublasMath_t cublas_math_mode = CUBLAS_PEDANTIC_MATH; // enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+    printf("| process rank          | %-50d |\n", nccl_config.process_rank);
+    printf("| world size            | %-50d |\n", nccl_config.mpi_world_size);
+    printf("| local device index    | %-50d |\n", nccl_config.local_device_idx);
     printf("| device                | %-50s |\n", deviceProp.name);
     printf("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1974,9 +2113,9 @@ int main(int argc, char *argv[]) {
     sprintf(train_tokens_filename, "%s_train.bin", input_dataset_prefix);
     sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
     DataLoader train_loader;
-    dataloader_init(&train_loader, train_tokens_filename, B, T);
+    dataloader_init(&train_loader, &nccl_config, train_tokens_filename, B, T);
     DataLoader val_loader;
-    dataloader_init(&val_loader, val_tokens_filename, B, T);
+    dataloader_init(&val_loader, NULL, val_tokens_filename, B, T);
     int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
@@ -2006,7 +2145,7 @@ int main(int argc, char *argv[]) {
         int last_step = step == train_num_batches;
 
         // once in a while estimate the validation loss
-        if (step % val_loss_every == 0 || last_step) {
+        if (nccl_config.process_rank == 0 && step % val_loss_every == 0 || last_step) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
@@ -2020,7 +2159,7 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while do model inference to print generated text
-        if (step > 0 && step % sample_every == 0 || last_step) {
+        if (nccl_config.process_rank == 0 && step > 0 && step % sample_every == 0 || last_step) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = GPT2_EOT;
@@ -2065,17 +2204,27 @@ int main(int argc, char *argv[]) {
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
+        for (int i = 0; i != B * T; ++i) {
+            if (i % T == 0) {
+                printf("\nBatch element %d: ", i / T);
+            }
+            const char* token_str = tokenizer_decode(&tokenizer, train_loader.inputs[i]);
+            safe_printf(token_str);
+        }
+        printf("\n");
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
+        gpt2_nccl_accumulate(&model, &nccl_config, B, T);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         total_sum_iteration_time_s += time_elapsed_s;
         int tokens_per_second = (B * T) / time_elapsed_s;
-        printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000, tokens_per_second);
+        printf("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, model.accumulated_mean_loss, time_elapsed_s * 1000, tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
+        break;
     }
     // add a total average, for optimizations that are only mild improvements
     printf("total average iteration time: %f ms\n", total_sum_iteration_time_s / train_num_batches * 1000);
@@ -2091,7 +2240,7 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasDestroy(cublas_handle));
     cublasCheck(cublasLtDestroy(cublaslt_handle));
     logger_free(&logger);
-
+    nccl_config_free(&nccl_config);
     return 0;
 }
 #endif
