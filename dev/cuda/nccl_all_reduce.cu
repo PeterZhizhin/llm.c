@@ -61,7 +61,7 @@ typedef struct {
   int process_rank;      // Rank of this process among all MPI processes on all hosts. 0 if no multi-GPU.
   int num_processes;     // Total number of processes on all hosts. 1 if no multi-GPU.
   int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
-  ncclComm_t nccl_comm;       // NCCL communication primitive, used for collective mutli-GPU work.
+  ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective mutli-GPU work.
 } MultiGpuConfig;
 
 // Determine which GPU this process should use.
