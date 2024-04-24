@@ -9,3 +9,4 @@ CompileFlags:
   - -lmpi_cxx 
   - -lnccl 
   - -I/usr/lib/x86_64-linux-gnu/openmpi/include/
+  - -DMULTI_GPU

@@ -9,7 +9,7 @@ CFLAGS_COND = -march=native
 NVCC := $(shell which nvcc 2>/dev/null)
 
 # NVCC flags
-NVCC_FLAGS = -O3 --use_fast_math
+NVCC_FLAGS = -O3 --use_fast_math -gencode arch=compute_80,code=sm_80
 NVCC_LDFLAGS = -lcublas -lcublasLt
 NCLL_INCLUDES = 
 NVCC_LDLIBS =
@@ -67,17 +67,18 @@ else
   endif
 endif
 
-ifeq ($(NO_MPI), 1)
-  $(info OpenMPI is manually disabled)
+ifeq ($(NO_MULTI_GPU), 1)
+  $(info Multi-GPU (OpenMPI + NCCL) is manually disabled)
 else
   # Detect if running on macOS or Linux
   ifeq ($(shell uname), Darwin)
-    $(warning MPI on Darwin is not supported, skipping MPI support)
+    $(warning Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
   else
     $(info Adding OpenMPI support)
     NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
     NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
     NVCC_LDLIBS += -lmpi -lnccl
+    NVCC_FLAGS += -DMULTI_GPU
   endif
 endif
 
@@ -110,10 +111,10 @@ train_gpt2fp32cu: train_gpt2_fp32.cu
 	$(NVCC) $(NVCC_FLAGS) $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $< $(NVCC_LDFLAGS) -o $@
 
 test_gpt2cu: test_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $< $(NVCC_LDFLAGS) -o $@
 
 test_gpt2fp32cu: test_gpt2_fp32.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $< $(NVCC_LDFLAGS) -o $@
 
 profile_gpt2cu: profile_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) -lineinfo $< $(NVCC_LDFLAGS) -o $@

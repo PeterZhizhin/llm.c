@@ -1,10 +1,13 @@
 /*
 
 A simple test of NCCL capabilities.
+Fills a vector with 1s on the first GPU, 2s on the second, etc.
+Then aggregates the values in the resulting vectors.
 
-To run it:
-nvcc -lmpi -lnccl -I/usr/lib/x86_64-linux-gnu/openmpi/include
--L/usr/lib/x86_64-linux-gnu/openmpi/lib/ nccl_all_reduce.cu -o nccl_all_reduce
+Compile example:
+nvcc -lmpi -lnccl -I/usr/lib/x86_64-linux-gnu/openmpi/include -L/usr/lib/x86_64-linux-gnu/openmpi/lib/ nccl_all_reduce.cu -o nccl_all_reduce
+
+Run on 2 local GPUs (set -np to a different value to change GPU count):
 mpirun -np 2 ./nccl_all_reduce
 
 */
@@ -53,45 +56,34 @@ __global__ void set_vector(float *data, int N, float value) {
 
 size_t cdiv(size_t a, size_t b) { return (a + b - 1) / b; }
 
-struct NCCL {
-  int process_rank;
-  int mpi_world_size;
-  ncclComm_t nccl_comm;
-  cudaStream_t stream;
-};
+// Parameters specific to training on multiple GPUs.
+typedef struct {
+  int process_rank;      // Rank of this process among all MPI processes. 0 if no multi-GPU.
+  int num_processes;     // Total number of processes. 1 if no multi-GPU.
+  int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
+  ncclComm_t nccl_comm;       // NCCL communication primitive, used for collective mutli-GPU work.
+} MultiGpuConfig;
 
-void ncclInit(int *argc, char ***argv, NCCL *nccl) {
-  // Initialize MPI.
-  mpiCheck(MPI_Init(argc, argv));
-  mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &nccl->process_rank));
-  mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &nccl->mpi_world_size));
-
-  // This process manages the defined device.
-  cudaCheck(cudaSetDevice(nccl->process_rank));
-
-  printf("Current process rank is: %d/%d\n", nccl->process_rank,
-         nccl->mpi_world_size);
-
-  // Generate and broadcast a unique NCCL ID for initialization.
-  ncclUniqueId nccl_id;
-  if (nccl->process_rank == 0) {
-    ncclCheck(ncclGetUniqueId(&nccl_id));
-  }
-  mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0,
-                     MPI_COMM_WORLD));
-
-  ncclCheck(ncclCommInitRank(&nccl->nccl_comm, nccl->mpi_world_size, nccl_id,
-                             nccl->process_rank));
-
-  // Create a stream for cross-device operations.
-  cudaCheck(cudaStreamCreate(&nccl->stream));
-  // nccl->stream = 0;
+MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
+    // Initialize MPI.
+    MultiGpuConfig result;
+    mpiCheck(MPI_Init(argc, argv));
+    mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
+    mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &result.num_processes));
+    result.local_device_idx = result.process_rank;
+    cudaCheck(cudaSetDevice(result.local_device_idx));
+    ncclUniqueId nccl_id;
+    if (result.process_rank == 0) {
+        ncclCheck(ncclGetUniqueId(&nccl_id));
+    }
+    mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
+    ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
+    return result;
 }
 
-void ncclDestroy(NCCL *nccl) {
-  cudaCheck(cudaStreamDestroy(nccl->stream));
-  ncclCommDestroy(nccl->nccl_comm);
-  mpiCheck(MPI_Finalize());
+void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
+    ncclCommDestroy(multi_gpu_config->nccl_comm);
+    mpiCheck(MPI_Finalize());
 }
 
 float get_mean(float *arr, size_t size, int process_rank) {
@@ -107,8 +99,7 @@ int main(int argc, char **argv) {
   const size_t all_reduce_buffer_size = 32 * 1024 * 1024;
   const size_t threads_per_block = 1024;
 
-  NCCL nccl;
-  ncclInit(&argc, &argv, &nccl);
+  MultiGpuConfig multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
   // Allocating buffers on each of the devices.
   float *all_reduce_buffer;
@@ -117,9 +108,9 @@ int main(int argc, char **argv) {
 
   int n_blocks = cdiv(all_reduce_buffer_size, threads_per_block);
   // Set the allocated memory to a defined value.
-  set_vector<<<n_blocks, threads_per_block, 0, nccl.stream>>>(
+  set_vector<<<n_blocks, threads_per_block>>>(
       all_reduce_buffer, all_reduce_buffer_size,
-      (float)(nccl.process_rank + 1));
+      (float)(multi_gpu_config.process_rank + 1));
   cudaCheck(cudaGetLastError());
 
   float *all_reduce_buffer_host =
@@ -129,9 +120,9 @@ int main(int argc, char **argv) {
                        sizeof(float) * all_reduce_buffer_size,
                        cudaMemcpyDeviceToHost));
 
-  printf("Process rank %d: average value is %.6f\n", nccl.process_rank,
+  printf("[Process rank %d] average value before all reduce is %.6f\n", multi_gpu_config.process_rank,
          get_mean(all_reduce_buffer_host, all_reduce_buffer_size,
-                  nccl.process_rank));
+                  multi_gpu_config.process_rank));
 
   float *all_reduce_buffer_recv;
   cudaCheck(cudaMalloc(&all_reduce_buffer_recv,
@@ -139,19 +130,28 @@ int main(int argc, char **argv) {
 
   ncclCheck(ncclAllReduce(
       (const void *)all_reduce_buffer, (void *)all_reduce_buffer_recv,
-      all_reduce_buffer_size, ncclFloat, ncclSum, nccl.nccl_comm, nccl.stream));
+      all_reduce_buffer_size, ncclFloat, ncclSum, multi_gpu_config.nccl_comm, 0));
 
-  cudaStreamSynchronize(nccl.stream);
 
   cudaCheck(cudaMemcpy(all_reduce_buffer_host, all_reduce_buffer_recv,
                        sizeof(float) * all_reduce_buffer_size,
                        cudaMemcpyDeviceToHost));
 
-  printf("Process rank %d: average value is %.6f\n", nccl.process_rank,
-         get_mean(all_reduce_buffer_host, all_reduce_buffer_size,
-                  nccl.process_rank));
+  float all_reduce_mean_value = get_mean(all_reduce_buffer_host, all_reduce_buffer_size, multi_gpu_config.process_rank);
+
+  printf("[Process rank %d] average value after all reduce is %.6f\n", multi_gpu_config.process_rank, all_reduce_mean_value);
+
+  float expected_all_reduce_mean_value = 0.0;
+  for (int i = 0; i != multi_gpu_config.num_processes; ++i) {
+    expected_all_reduce_mean_value += i + 1;
+  }
+  if (abs(expected_all_reduce_mean_value - all_reduce_mean_value) > 1e-5) {
+    printf("[Process rank %d] ERROR: Unexpected all reduce value: %.8f, expected %.8f\n", multi_gpu_config.process_rank, all_reduce_mean_value, expected_all_reduce_mean_value);
+  } else {
+    printf("[Process rank %d] Checked against expected mean value. All good!\n", multi_gpu_config.process_rank);
+  }
 
   free(all_reduce_buffer_host);
   cudaCheck(cudaFree(all_reduce_buffer));
-  ncclDestroy(&nccl);
+  multi_gpu_config_free(&multi_gpu_config);
 }
