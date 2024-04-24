@@ -1303,13 +1303,53 @@ float* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) 
 
 // Parameters specific to training on multiple GPUs.
 typedef struct {
-    int process_rank;      // Rank of this process among all MPI processes. 0 if no multi-GPU.
+    int process_rank;      // Rank of this process among all MPI processes on all hosts. 0 if no multi-GPU.
     int num_processes;     // Total number of processes. 1 if no multi-GPU.
     int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
 #ifdef MULTI_GPU
     ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective mutli-GPU work.
 #endif
 } MultiGpuConfig;
+
+#ifdef MULTI_GPU
+// Determine which GPU this process should use.
+// Processes on the same machines use different GPU indicies. Processes on other machines don't.
+// Copied from NCCL examples: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/examples.html#example-2-one-device-per-process-or-thread
+int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
+  char hostname[1024];
+  hostname[1023] = '\0';
+  // All processes on the same machine will share the same hostname.
+  gethostname(hostname, 1023);
+  for (int i=0; i < 1024; i++) {
+    if (hostname[i] == '.') {
+        hostname[i] = '\0';
+        break;
+    }
+  }
+  uint64_t hostname_hash = 5381;
+  for (int c = 0; hostname[c] != '\0'; c++){ hostname_hash = ((hostname_hash << 5) + hostname_hash) ^ hostname[c]; }
+
+  // Distribute all hostname hashes to all processes.
+  uint64_t* all_hostsname_hashes = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
+  mpiCheck(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_hostsname_hashes, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD));
+
+  // Identify which GPU we need to use.
+  int local_device_idx = 0;
+  for (int current_process = 0; current_process < num_processes; ++current_process) {
+     if (current_process == process_rank) {
+      // Found my gpu, local_device_idx now has my target GPU index.
+      break;
+     }
+     if (all_hostsname_hashes[current_process] == all_hostsname_hashes[process_rank]) {
+      // This process ID runs on the same machine, but it's not me, skip this GPU
+      local_device_idx++;
+     }
+  }
+
+  free(all_hostsname_hashes);
+  return local_device_idx;
+}
+#endif
 
 MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
 #ifdef MULTI_GPU
@@ -1318,7 +1358,7 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     mpiCheck(MPI_Init(argc, argv));
     mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
     mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &result.num_processes));
-    result.local_device_idx = result.process_rank;
+    result.local_device_idx = multi_gpu_get_local_device_idx(result.process_rank, result.num_processes);
     cudaCheck(cudaSetDevice(result.local_device_idx));
     ncclUniqueId nccl_id;
     if (result.process_rank == 0) {
@@ -1704,13 +1744,10 @@ float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_conf
 }
 
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
-void gpt2_mutli_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config, int B, int T) {
+void gpt2_mutli_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
     // Average all losses.
     model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
 #ifdef MULTI_GPU
-    mpiCheck(MPI_Allreduce(&model->mean_loss, &model->accumulated_mean_loss, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    model->accumulated_mean_loss /= multi_gpu_config->num_processes;
-
     // Average all gradients.
     ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
         model->num_parameters,
@@ -1824,7 +1861,6 @@ void dataloader_next_batch(DataLoader *loader) {
     // read the B*T+1 integers from the file into batch
     fseek(loader->tokens_file, loader->current_position, SEEK_SET);
     freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T*num_processes integers
     loader->current_position += loader->num_processes * B * T * sizeof(int);
 }
 
@@ -2053,7 +2089,7 @@ int main(int argc, char *argv[]) {
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
     int enable_tf32 = deviceProp.major >= 8 ? 1 : 0;
     cublas_compute_type = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
-    cublasMath_t cublas_math_mode = CUBLAS_PEDANTIC_MATH; // enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+    cublasMath_t cublas_math_mode = enable_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
     printf("| process rank          | %-50d |\n", multi_gpu_config.process_rank);
@@ -2176,7 +2212,7 @@ int main(int argc, char *argv[]) {
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
-        gpt2_mutli_gpu_accumulate(&model, &multi_gpu_config, B, T);
+        gpt2_mutli_gpu_accumulate(&model, &multi_gpu_config);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
@@ -2201,6 +2237,7 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasLtDestroy(cublaslt_handle));
     logger_free(&logger);
     multi_gpu_config_free(&multi_gpu_config);
+
     return 0;
 }
 #endif
