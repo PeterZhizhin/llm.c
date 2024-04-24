@@ -73,12 +73,14 @@ else
   # Detect if running on macOS or Linux
   ifeq ($(shell uname), Darwin)
     $(warning Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
-  else
+  else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && echo "exists"), exists)
     $(info Adding OpenMPI support)
     NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
     NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
     NVCC_LDLIBS += -lmpi -lnccl
     NVCC_FLAGS += -DMULTI_GPU
+  else
+    $(warning OpenMPI is not found, disabling multi-GPU support)
   endif
 endif
 
@@ -105,16 +107,16 @@ test_gpt2: test_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
 train_gpt2cu: train_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 train_gpt2fp32cu: train_gpt2_fp32.cu
-	$(NVCC) $(NVCC_FLAGS) $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 test_gpt2cu: test_gpt2.cu
-	$(NVCC) $(NVCC_FLAGS) $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 test_gpt2fp32cu: test_gpt2_fp32.cu
-	$(NVCC) $(NVCC_FLAGS) $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $< $(NVCC_LDFLAGS) -o $@
+	$(NVCC) $(NVCC_FLAGS) $< $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS) $(NVCC_LDFLAGS) -o $@
 
 profile_gpt2cu: profile_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) -lineinfo $< $(NVCC_LDFLAGS) -o $@
