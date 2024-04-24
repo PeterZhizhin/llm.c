@@ -1331,15 +1331,15 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     printf("Multi-GPU support is disabled. Using a single GPU.");
     return MultiGpuConfig{
         .process_rank = 0,
-        .mpi_world_size = 1,
+        .num_processes = 1,
         .local_device_idx = 0,
-    }
+    };
 #endif
 }
 
 void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
-    ncclCommDestroy(multi_gpu_config->nccl_comm);
+    ncclCheck(ncclCommDestroy(multi_gpu_config->nccl_comm));
     mpiCheck(MPI_Finalize());
 #endif
 }
@@ -1691,10 +1691,23 @@ void gpt2_backward(GPT2 *model) {
     encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
 }
 
+// Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
+float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
+#ifdef MULTI_GPU
+    // MPI doesn't support all reduce with mean, so we sum up, then divide.
+    float result;
+    mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
+    return result / multi_gpu_config->num_processes;
+#else
+    return value;
+#endif
+}
+
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
 void gpt2_mutli_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config, int B, int T) {
+    // Average all losses.
+    model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
 #ifdef MULTI_GPU
-    // Average all losses. MPI all reduce doesn't support mean, so we sum up, then divide.
     mpiCheck(MPI_Allreduce(&model->mean_loss, &model->accumulated_mean_loss, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
     model->accumulated_mean_loss /= multi_gpu_config->num_processes;
 
@@ -1705,8 +1718,6 @@ void gpt2_mutli_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config, in
         multi_gpu_config->nccl_comm,
         // use 0 for default stream (all other computations use this stream)
         /*stream=*/0));
-#else
-    model->accumulated_mean_loss = model->mean_loss;
 #endif
 }
 
@@ -1772,14 +1783,8 @@ typedef struct {
 } DataLoader;
 
 void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config, const char* filename, int B, int T) {
-    if (multi_gpu_config == NULL) {
-        // Eval is done only on the main process.
-        loader->process_rank = 0;
-        loader->num_processes = 1;
-    } else {
-        loader->process_rank = multi_gpu_config->process_rank;
-        loader->num_processes = multi_gpu_config->num_processes;
-    }
+    loader->process_rank = multi_gpu_config->process_rank;
+    loader->num_processes = multi_gpu_config->num_processes;
     loader->B = B;
     loader->T = T;
 
@@ -2078,7 +2083,7 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader;
     dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
     DataLoader val_loader;
-    dataloader_init(&val_loader, NULL, val_tokens_filename, B, T);
+    dataloader_init(&val_loader, &multi_gpu_config, val_tokens_filename, B, T);
     int train_num_batches = train_loader.num_batches; // let's do 1 epoch by default for now
     int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
@@ -2108,7 +2113,7 @@ int main(int argc, char *argv[]) {
         int last_step = step == train_num_batches;
 
         // once in a while estimate the validation loss
-        if (multi_gpu_config.process_rank == 0 && step % val_loss_every == 0 || last_step) {
+        if (step % val_loss_every == 0 || last_step) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
@@ -2117,6 +2122,7 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
+            val_loss = multi_gpu_cpu_float_mean(val_loss, &multi_gpu_config);
             printf("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
