@@ -13,10 +13,10 @@ CUDA_OUTPUT_FILE = -o $@
 
 # NVCC flags
 # -t=0 is short for --threads, 0 = number of CPUs on the machine
-NVCC_FLAGS = -O3 -t=0 --use_fast_math
+NVCC_FLAGS = -O3 -t=0 --use_fast_math -gencode=arch=compute_80,code=sm_80 --generate-line-info
 NVCC_LDFLAGS = -lcublas -lcublasLt
-NCLL_INCLUDES =
-NVCC_LDLIBS =
+NVCC_INCLUDES = -I/usr/lib/x86_64-linux-gnu/openmpi/include
+NVCC_LDLIBS =  -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
 
 ifneq ($(OS), Windows_NT)
   NVCC := $(shell which nvcc 2>/dev/null)
@@ -98,26 +98,6 @@ else
       else
         $(warning OpenMP not found, skipping OpenMP support)
       endif
-    endif
-  endif
-endif
-
-ifeq ($(NO_MULTI_GPU), 1)
-  $(info Multi-GPU (OpenMPI + NCCL) is manually disabled)
-else
-  ifneq ($(OS), Windows_NT)
-    # Detect if running on macOS or Linux
-    ifeq ($(SHELL_UNAME), Darwin)
-      $(warning Multi-GPU on CUDA on Darwin is not supported, skipping OpenMPI + NCCL support)
-    else ifeq ($(shell [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/ ] && [ -d /usr/lib/x86_64-linux-gnu/openmpi/include/ ] && echo "exists"), exists)
-      $(info OpenMPI found, adding support)
-      NVCC_INCLUDES += -I/usr/lib/x86_64-linux-gnu/openmpi/include
-      NVCC_LDFLAGS += -L/usr/lib/x86_64-linux-gnu/openmpi/lib/
-      NVCC_LDLIBS += -lmpi -lnccl
-      NVCC_FLAGS += -DMULTI_GPU
-    else
-      $(warning OpenMPI is not found, disabling multi-GPU support)
-      $(warning On Linux you can try install OpenMPI with `sudo apt install openmpi-bin openmpi-doc libopenmpi-dev`)
     endif
   endif
 endif
