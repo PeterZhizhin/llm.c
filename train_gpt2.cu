@@ -61,9 +61,6 @@ enum PrecisionMode {
 // Default Properties
 typedef float floatN;
 #define CUBLAS_LOWP_COMPUTE cublas_compute_type
-#ifdef MULTI_GPU
-const ncclDataType_t ncclFloatN = ncclFloat;
-#endif
 
 // Specific configurations based on the enabled precision
 #if defined(ENABLE_FP32)
@@ -1837,7 +1834,7 @@ void dataloader_next_batch(DataLoader *loader) {
     // read the B*T+1 integers from the file into batch
     fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
     freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T*num_processes integers
+    // advance the current position by B*T integers
     loader->current_position += B * T * sizeof(int);
 }
 
@@ -2115,8 +2112,7 @@ int main(int argc, char *argv[]) {
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         total_sum_iteration_time_s += time_elapsed_s;
         int tokens_per_second = (B * T) / time_elapsed_s;
-        float accumulated_loss = model.mean_loss;
-        printf("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, accumulated_loss, time_elapsed_s * 1000, tokens_per_second);
+        printf("step %4d/%d: train loss %f (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, time_elapsed_s * 1000, tokens_per_second);
         logger_log_train(&logger, step, model.mean_loss);
     }
     // add a total average, for optimizations that are only mild improvements
